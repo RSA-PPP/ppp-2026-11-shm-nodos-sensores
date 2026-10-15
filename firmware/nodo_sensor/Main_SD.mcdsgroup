@@ -1,0 +1,6 @@
+[PROJECTS]
+Count=2
+Project0=..\Principal_SD\Principal.mcpds
+Project1=Main_SD.mcpds
+[ActiveProject]
+Index=0

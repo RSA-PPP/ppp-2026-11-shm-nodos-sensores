@@ -1,35 +1,44 @@
-
 // *****************************************************************************
 // Controlador de una tarjeta SD mediante SPI.
 // Las operaciones de lectura y escritura trabajan con sectores completos de
-// 512 bytes y acceden directamente a la dirección física de cada sector.
-
+// 512 bytes y acceden directamente a la direccion fisica de cada sector.
+//
+// Cambios respecto a la version anterior (compatibilidad Kingston / SanDisk):
+//   - R1_Response() espera el primer byte distinto de 0xFF (hasta 32 bytes)
+//     en lugar de leer siempre dos bytes fijos.
+//   - SD_Read_Block y SD_Write_Block liberan CS y envian un byte extra de reloj
+//     en TODAS las rutas de salida (antes algunas dejaban CS en bajo).
+//   - sd_ultimo_r1 guarda la ultima respuesta R1 para depurar.
 // *****************************************************************************
 
-// Dependencias del controlador.
 #include "spiSD.h"
 #include "sdcard.h"
 #include <stdbool.h>
 
-// *****************************************************************************
-// Señales y estado compartidos con la aplicación.
-// *****************************************************************************
-// Señales de chip select definidas por la aplicación.
-extern sfr sbit sd_CS_lat; // Chip select, activo en bajo.
+// Tiempo maximo de espera (en bytes de reloj) para fin de escritura (busy) y
+// para el token de datos. A ~1.5 MHz son ~0.4 s; la especificacion SD permite
+// hasta 250 ms de programacion en escritura. SD_TIME_OUT (2000) es demasiado
+// corto en FAST: equivale a unos 10 ms y las tarjetas lo superan.
+#define SD_BUSY_TIME_OUT 65000
 
-extern sfr sbit sd_CS_tris; // Dirección del chip select: 0 salida, 1 entrada.
+// *****************************************************************************
+// Senales y estado compartidos con la aplicacion.
+// *****************************************************************************
+extern sfr sbit sd_CS_lat;     // Chip select, activo en bajo.
+extern sfr sbit sd_CS_tris;    // Direccion del chip select.
 
-// Pin de detección de la tarjeta.
 extern sfr sbit sd_detect_port;
 extern sfr sbit sd_detect_tris;
 
-// Estado de la tarjeta, definido e inicializado por la aplicación.
 extern struct sdflags sdflags;
 
 // Card Capacity Status: 0x02 para SDSC y 0x03 para SDHC/SDXC.
 unsigned char ccs;
 
-// Genera parpadeos de diagnóstico en el LED de la tarjeta.
+// Ultima respuesta R1 recibida (para depuracion con el debugger).
+unsigned char sd_ultimo_r1;
+
+// Genera parpadeos de diagnostico en el LED de la tarjeta (RA1).
 void LEDcard(int veces, unsigned char tiempo_seg){
      unsigned int i;
     TRISAbits.TRISA1 = 0;
@@ -51,15 +60,25 @@ void LEDcard(int veces, unsigned char tiempo_seg){
 }
 
 // *****************************************************************************
-// Lee nbytes después de recibir el token de inicio de datos.
+// Libera la tarjeta y envia un byte de reloj para que suelte la linea MISO.
+// Solo usar cuando SPI1 ya esta inicializado.
+// *****************************************************************************
+void SD_Liberar_Bus(void){
+    sd_CS_lat = 1;
+    asm nop;
+    SPISD_Write(0xFF);
+}
+
+// *****************************************************************************
+// Lee nbytes despues de recibir el token de inicio de datos.
 // *****************************************************************************
 unsigned char SD_Read(unsigned char *Buffer, unsigned int nbytes){
     unsigned int i;
     unsigned char temp;
-    for(i = 0; i < SD_TIME_OUT; i++){
+    for(i = 0; i < SD_BUSY_TIME_OUT; i++){
         temp = SPISD_Write(0xFF);
         if(temp == 0xFE) break;
-        if(i == SD_TIME_OUT-1) return TOKEN_NOT_RECEIVED;
+        if(i == SD_BUSY_TIME_OUT-1) return TOKEN_NOT_RECEIVED;
     }
     for(i = 0; i < nbytes; i++){
         Buffer[i] = SPISD_Write(0xFF);
@@ -68,33 +87,31 @@ unsigned char SD_Read(unsigned char *Buffer, unsigned int nbytes){
     temp = SPISD_Write(0xFF);     // Descarta el segundo byte de CRC.
     return 0x00;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
 // Lee un sector completo de 512 bytes.
+// Devuelve 0 si fue correcto; en error, el codigo R1 o de la libreria.
 // *****************************************************************************
 unsigned char SD_Read_Block(unsigned char *Buffer, unsigned long Address){
     unsigned char temp;
     Select_SD();
 
-    if(ccs == 0x02) Address<<=9;                      // Convierte el sector a bytes para SDSC.
-    if(SD_Ready() == 0) return SD_NOT_READY;
+    if(ccs == 0x02) Address<<=9;                      // SDSC: sector a bytes.
+    if(SD_Ready() == 0){
+        SD_Liberar_Bus();
+        return SD_NOT_READY;
+    }
     SD_Send_Command(READ_SINGLE_BLOCK,Address,0xFF);
     temp = R1_Response();
-    if(temp == 0xFF){LEDcard(10,2);}
-    if(temp != 0x00) return temp;
+    if(temp != 0x00){
+        SD_Liberar_Bus();
+        return temp;
+    }
     temp = SD_Read(Buffer,512);
 
-    Release_SD();
+    SD_Liberar_Bus();
     return temp;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
 // Escribe un sector completo de 512 bytes.
@@ -105,31 +122,36 @@ unsigned char SD_Write_Block(unsigned char *Buffer, unsigned long Address){
 
     Select_SD();
 
-    if(ccs == 0x02) Address<<=9;        // Convierte el sector a bytes para SDSC.
-    if(SD_Ready() == 0) return SD_NOT_READY;
+    if(ccs == 0x02) Address<<=9;        // SDSC: sector a bytes.
+    if(SD_Ready() == 0){
+        SD_Liberar_Bus();
+        return SD_NOT_READY;
+    }
     SD_Send_Command(WRITE_BLOCK,Address,0xFF);
     temp = R1_Response();
-    if(temp != 0x00) return temp;
-    temp = SPISD_Write(0xFE);    // Token de inicio del bloque.
+    if(temp != 0x00){
+        SD_Liberar_Bus();
+        return temp;
+    }
+    temp = SPISD_Write(0xFE);           // Token de inicio del bloque.
     for(i = 0; i < 512; i++){
         temp = SPISD_Write(Buffer[i]);
     }
-    temp = SPISD_Write(0xFF);        // CRC ficticio, byte alto.
-    temp = SPISD_Write(0xFF);
-    temp = SPISD_Write(0xFF); // Respuesta de datos.
+    temp = SPISD_Write(0xFF);           // CRC ficticio, byte alto.
+    temp = SPISD_Write(0xFF);           // CRC ficticio, byte bajo.
+    temp = SPISD_Write(0xFF);           // Respuesta de datos.
     temp = (temp&0x0E)>>1;
-    if(SD_Ready() == 0) return SD_NOT_READY;
+    if(SD_Ready() == 0){                // Espera fin de escritura (busy).
+        SD_Liberar_Bus();
+        return SD_NOT_READY;
+    }
 
-    Release_SD();
+    SD_Liberar_Bus();
     if(temp == 0x02) return DATA_ACCEPTED;
     else if(temp == 0x05) return DATA_REJECTED_CRC_ERROR;
     else if(temp == 0x06) return DATA_REJECTED_WR_ERROR;
     else return ERROR;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
 // Intenta inicializar la tarjeta hasta try_value veces.
@@ -145,16 +167,11 @@ unsigned char SD_Init_Try(unsigned char try_value){
     }
     return init_status;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
-// Inicializa la tarjeta y devuelve un código de estado.
+// Inicializa la tarjeta y devuelve un codigo de estado.
 // *****************************************************************************
 unsigned char SD_Init(void){
-    // Variables locales del protocolo.
     unsigned int i;
     unsigned int j;
     unsigned char temp;
@@ -165,19 +182,18 @@ unsigned char SD_Init(void){
 
     Release_SD();
 
-    // La inicialización requiere una velocidad baja.
+    // La inicializacion requiere una velocidad baja.
     SPISD_Init(SLOW);
 
-    // Envía al menos 74 ciclos con MOSI en alto antes de CMD0.
+    // Envia al menos 74 ciclos con MOSI en alto antes de CMD0.
     for(i = 0; i < 80; i++) SPISD_Write(0xFF);
 
     Select_SD();
 
-    // Mantiene la línea de reloj activa antes del primer comando.
+    // Mantiene la linea de reloj activa antes del primer comando.
     for(i = 0; i < 16; i++) SPISD_Write(0xFF);
 
-
-    // Envía CMD0 hasta que la tarjeta responda en estado inactivo.
+    // Envia CMD0 hasta que la tarjeta responda en estado inactivo.
     for(i = 0; i < SD_TIME_OUT; i++){
         SD_Send_Command(GO_IDLE_STATE,0x00000000,0x4A);     // CMD0
         temp = R1_Response();
@@ -186,18 +202,17 @@ unsigned char SD_Init(void){
         }
         if(i==(SD_TIME_OUT-1)) return CARD_NOT_INSERTED;
     }
-    
 
-    // CMD8 comprueba el rango de 2.7 a 3.6 V y el patrón 0xAA.
+    // CMD8 comprueba el rango de 2.7 a 3.6 V y el patron 0xAA.
     if(SD_Ready() == 0){
        return SD_NOT_READY;
     }
-    
+
     SD_Send_Command(SEND_IF_COND,0x000001AA,0x43);          // CMD8
     temp = R1_Response();
-    
+
     if(temp != (1<<IDLE_STATE)){
-        // Una respuesta distinta indica una tarjeta antigua: usa CMD1.
+        // Tarjeta antigua: usa CMD1.
         for(i = 0; i < SD_TIME_OUT; i++){
             if(SD_Ready() == 0) return SD_NOT_READY;
             SD_Send_Command(SEND_OP_COND,0x00000000,0x7C);  // CMD1
@@ -205,7 +220,7 @@ unsigned char SD_Init(void){
             if(temp == 0x00) break;
             if(i==(SD_TIME_OUT-1)) return UNUSABLE_CARD;
         }
-        
+
     } else if (temp == (1<<IDLE_STATE)){
 
         temp_long = Response_32b();
@@ -217,28 +232,28 @@ unsigned char SD_Init(void){
         // Lee el registro OCR.
         if(SD_Ready() == 0) return SD_NOT_READY;
         SD_Send_Command(READ_OCR,0x00000000,0x7E);          // CMD58
-        temp = R1_Response();                               // Parte de la respuesta R3
+        temp = R1_Response();
         if(temp != (1<<IDLE_STATE)) return temp;
-        temp_long = Response_32b();                         // Parte de la repuesta R3
+        temp_long = Response_32b();
         if((temp_long & VOLTAGE_RANGE_MASK) != VOLTAGE_RANGE_MASK)
             return INCOMPATIBLE_VOLTAGE;
 
-        // Activa temporalmente la verificación CRC antes de ACMD41.
+        // Activa temporalmente la verificacion CRC antes de ACMD41.
         if(SD_Ready() == 0) return SD_NOT_READY;
-        SD_Send_Command(CRC_ON_OFF,0x00000001,0x48);        // CMD59, CRC final 0x91
+        SD_Send_Command(CRC_ON_OFF,0x00000001,0x48);        // CMD59
         temp = R1_Response();
         if(temp != (1<<IDLE_STATE)) return temp;
 
-        // Espera a que termine la inicialización de la tarjeta.
+        // Espera a que termine la inicializacion de la tarjeta.
         for(i = 0; i < SD_TIME_OUT; i++){
             if(SD_Ready() == 0) return SD_NOT_READY;
             SD_Send_Command(APP_CMD,0x00000000,0x32);           // CMD55
             temp = R1_Response();
             if(SD_Ready() == 0) return SD_NOT_READY;
-            
-            // Mantiene la separación requerida entre comandos.
+
+            // Mantiene la separacion requerida entre comandos.
             for(j = 0; j < 16; j++) SPISD_Write(0xFF);
-            
+
             SD_Send_Command(SD_SEND_OP_COND,0x40000000,0x3B);   // ACMD41
             temp = R1_Response();
             if(temp == 0x00) break;
@@ -247,13 +262,13 @@ unsigned char SD_Init(void){
     }
     else return temp;
 
-    // Desactiva la verificación CRC para los comandos siguientes.
+    // Desactiva la verificacion CRC para los comandos siguientes.
     if(SD_Ready() == 0) return SD_NOT_READY;
     SD_Send_Command(CRC_ON_OFF,0x00000000,0x48);        // CMD59
     temp = R1_Response();
     if(temp != 0x00) return temp;
 
-    // Fija el tamaño de bloque en 512 bytes.
+    // Fija el tamano de bloque en 512 bytes.
     if(SD_Ready() == 0) return SD_NOT_READY;
     SD_Send_Command(SET_BLOCKLEN,0x00000200,0x0A);      // CMD16
     temp = R1_Response();
@@ -268,31 +283,32 @@ unsigned char SD_Init(void){
     ccs = (long)(temp_long >> 30);
 
     Release_SD();
-    
-    // Envía ciclos adicionales antes de cambiar la velocidad.
+
+    // Ciclos adicionales antes de cambiar la velocidad.
     for(i = 0; i < 16; i++) SPISD_Write(0xFF);
-    
-    // Cambia SPI a la velocidad de operación.
+
+    // Cambia SPI a la velocidad de operacion.
     SPISD_Init(FAST);
 
     return SUCCESSFUL_INIT;
 }
-// *****************************************************************************
-// *****************************************************************************
-
 
 // *****************************************************************************
-// Recibe una respuesta R1 de 8 bits.
+// Recibe una respuesta R1 de 8 bits: espera el primer byte distinto de 0xFF
+// (la especificacion permite hasta 8 bytes de espera; se admiten 32).
+// Devuelve 0xFF si la tarjeta no responde.
 // *****************************************************************************
 unsigned char R1_Response(void){
     unsigned char temp;
-    temp = SPISD_Write(0xFF);
-    temp = SPISD_Write(0xFF);
+    unsigned char n;
+    temp = 0xFF;
+    for(n = 0; n < 32; n++){
+        temp = SPISD_Write(0xFF);
+        if(temp != 0xFF) break;
+    }
+    sd_ultimo_r1 = temp;
     return temp;
 }
-// *****************************************************************************
-// *****************************************************************************
-
 
 // *****************************************************************************
 // Recibe una respuesta R2 de 16 bits.
@@ -306,9 +322,6 @@ unsigned int R2_Response(void){
     response = (response<<8)|temp;
     return response;
 }
-// *****************************************************************************
-// *****************************************************************************
-
 
 // *****************************************************************************
 // Recibe los 32 bits de una respuesta extendida.
@@ -325,30 +338,21 @@ unsigned long Response_32b(void){
     response = (response<<8)|temp;
     return response;
 }
-// *****************************************************************************
-// *****************************************************************************
-
 
 // *****************************************************************************
-// Envía un comando SD con argumento y CRC7.
+// Envia un comando SD con argumento y CRC7.
 // *****************************************************************************
 void SD_Send_Command(unsigned char command,unsigned long argument, unsigned char crc){
 
     SPISD_Write(command |= 0x40);
 
-    // Envía el argumento de 32 bits.
     SPISD_Write((unsigned char)(argument>>24));
     SPISD_Write((unsigned char)(argument>>16));
     SPISD_Write((unsigned char)(argument>>8));
     SPISD_Write((unsigned char)(argument));
 
-    // Envía el CRC y el bit de parada.
     SPISD_Write((crc<<1)|0x01);
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
 // Espera hasta que la tarjeta quede libre.
@@ -356,17 +360,13 @@ void SD_Send_Command(unsigned char command,unsigned long argument, unsigned char
 unsigned char SD_Ready(void){
     unsigned int i;
     unsigned char temp;
-    for(i = 0; i < SD_TIME_OUT; i++){
+    for(i = 0; i < SD_BUSY_TIME_OUT; i++){
         temp = SPISD_Write(0xFF);
         if(temp == 0xFF) break;
-        if(i == (SD_TIME_OUT-1)) return 0x00;
+        if(i == (SD_BUSY_TIME_OUT-1)) return 0x00;
     }
     return temp;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
 // Libera la tarjeta colocando CS en nivel alto.
@@ -375,10 +375,6 @@ void Release_SD(void){
     sd_CS_lat = 1;
     asm nop;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
 // Selecciona la tarjeta colocando CS en nivel bajo.
@@ -387,13 +383,9 @@ void Select_SD(void){
     sd_CS_lat = 0;
     asm nop;
 }
-// *****************************************************************************
-// *****************************************************************************
-
-
 
 // *****************************************************************************
-// Devuelve DETECTED si el pin indica que la tarjeta está insertada.
+// Devuelve DETECTED si el pin indica que la tarjeta esta insertada.
 // *****************************************************************************
 unsigned char SD_Detect(void) {
     if (sd_detect_port == 0) {
@@ -402,5 +394,3 @@ unsigned char SD_Detect(void) {
          return 0;
     }
 }
-// *****************************************************************************
-// *****************************************************************************
