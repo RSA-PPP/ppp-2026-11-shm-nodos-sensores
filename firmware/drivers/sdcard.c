@@ -19,7 +19,7 @@
 // para el token de datos. A ~1.5 MHz son ~0.4 s; la especificacion SD permite
 // hasta 250 ms de programacion en escritura. SD_TIME_OUT (2000) es demasiado
 // corto en FAST: equivale a unos 10 ms y las tarjetas lo superan.
-#define SD_BUSY_TIME_OUT 65000
+#define SD_BUSY_TIME_OUT 400000
 
 // *****************************************************************************
 // Senales y estado compartidos con la aplicacion.
@@ -73,7 +73,7 @@ void SD_Liberar_Bus(void){
 // Lee nbytes despues de recibir el token de inicio de datos.
 // *****************************************************************************
 unsigned char SD_Read(unsigned char *Buffer, unsigned int nbytes){
-    unsigned int i;
+    unsigned long i;
     unsigned char temp;
     for(i = 0; i < SD_BUSY_TIME_OUT; i++){
         temp = SPISD_Write(0xFF);
@@ -358,7 +358,7 @@ void SD_Send_Command(unsigned char command,unsigned long argument, unsigned char
 // Espera hasta que la tarjeta quede libre.
 // *****************************************************************************
 unsigned char SD_Ready(void){
-    unsigned int i;
+    unsigned long i;
     unsigned char temp;
     for(i = 0; i < SD_BUSY_TIME_OUT; i++){
         temp = SPISD_Write(0xFF);

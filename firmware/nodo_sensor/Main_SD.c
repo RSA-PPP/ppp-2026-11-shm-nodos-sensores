@@ -1,28 +1,43 @@
 // *****************************************************************************
-// Fase 2 - Validacion de inicializacion, escritura y lectura cruda en microSD
-// dsPIC33EP256MC202 - SPI1 (SCK=RB7, SDO=RB8, SDI=RB9) - CS=RB0 - Detect=RA4
+// Nodo Sensor - Fase 3: recepcion de tiempo por RS485 y registro en MicroSD
+// dsPIC33EP256MC202, Fosc = 80 MHz (FRC+PLL), Fcy = 40 MHz
 //
-// Secuencia:
-//   1. Espera tarjeta (card-detect RA4, activo en bajo, con antirrebote)
-//   2. SD_Init_Try (SLOW -> FAST)
-//   3. Escribe patron 00..FF x2 en sector 2500
-//   4. Lee el sector 2500 a RAM
-//   5. Compara byte a byte
-//   6. Copia lo leido al sector 2501
-//   7. LED fijo = todo correcto
+// Recepcion de la trama por INTERRUPCION del UART1 (urx_1) y conteo de segundos
+// por la interrupcion fisica INT1 (pulso INT_SINC del Concentrador).
 //
-// Codigos de error: grupo 1 = codigo (parpadeos de 300 ms), pausa 1.5 s,
-// grupo 2 = detalle (parpadeos MUY rapidos de 100 ms), pausa 4 s, se repite.
-//   Grupo 1: 1 = fallo SD_Init            2 = fallo escritura sector 2500
-//            3 = fallo lectura 2500       4 = datos leidos distintos
-//            5 = fallo escritura sector 2501
-//   Grupo 2 (detalle del estado devuelto por la libreria):
-//            0 = sin detalle   1 = tarjeta ocupada/timeout (SD_NOT_READY)
-//            2 = token de datos no recibido   3 = sin respuesta R1 (0xFF)
-//            4 = CRC rechazado  5 = error de escritura  6 = token inesperado
-//            7 = R1 con bits de error u otro
+// Funcionamiento:
+//  - urx_1 decodifica con una maquina de estados la trama:
+//      [0x3A][DIR][0x54][TS3][TS2][TS1][TS0][CHK]     CHK = suma bytes 0..6 (8 bits)
+//    Si checksum, funcion y direccion (255 o ID_NODO) son validos: guarda el
+//    timestamp, resincroniza el contador local, levanta banTramaValida y cambia el
+//    LED TEST segun la paridad del timestamp (CP 3.1).
+//  - Cuando termina el silencio posterior a la trama (Timer2, SILENCIO_US) el bucle
+//    principal arma un sector de 512 bytes y lo escribe en la SD (CP 3.2).
+//  - INT1 (RB14/RP46) incrementa timestamp_local y pulsosPPS una vez por segundo.
+//    Prioridades: urx_1 = 7, INT1 = 5.
+//  - Solo se escriben timestamps RECIBIDOS por RS485 (no se reconstruye ninguno). Los
+//    contadores de diagnostico (bytes 28-33) indican por que se perderia una trama.
 //
-// NOTA: escribe sectores crudos (2500 y 2501). Usar SD sin datos importantes.
+// Formato del sector (todo big-endian):
+//   0-1   : A5 5A (marca)
+//   2     : ID del nodo
+//   3     : 0x45 | polaridad<<1  (bit2 = recepcion por urx_1; bit1 = reposo alto)
+//   4-7   : timestamp del sector
+//   8-11  : contador de paquetes (1, 2, 3, ...)
+//   12-15 : numero de sector donde se escribe
+//   16-17 : errores de checksum / formato / OERR acumulados
+//   18-19 : saltos de timestamp en tramas RECIBIDAS (ts != ts_anterior + 1)
+//   20-21 : errores de escritura en SD acumulados
+//   22-23 : tramas descartadas (llego otra trama valida antes de guardar la anterior)
+//   24-25 : pulsos fisicos contados por INT1
+//   26-27 : discrepancias entre el contador de pulsos y el timestamp de la trama
+//   28-29 : bytes descartados fuera de trama (primer byte distinto de 0x3A)
+//   30-31 : tramas truncadas por silencio a mitad de trama (> SILENCIO_US entre bytes)
+//   32-33 : errores de UART (FERR/PERR) en bytes recibidos
+//   34-511: 00
+//
+// Proyecto MikroC: Oscillator Frequency = 80.000000 MHz, Oscillator Source = FRCPLL.
+// Archivos del proyecto: Main_SD.c, sdcard.c, spiSD.c (+ sus .h).
 // *****************************************************************************
 
 #include <spiSD.h>
@@ -30,306 +45,429 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-// RP41 = RB9: entrada SDI1 de SPI1.
+// RP41 = RB9: entrada SDI1 de SPI1 (MikroC no define RPINR20bits para este chip)
 #define RPINR20 (*((volatile unsigned int*)0x06C8))
 
-// Parametros de la aplicacion.
-#define IDNODO 1
-#define SIZESD 16                    // Capacidad de la SD en GB.
-#define DELTASECTOR 97952
+// RPINR0 (INT1R en los bits 14:8). En esta familia RPINRn esta en 0x06A0 + 2*n.
+#define RPINR0  (*((volatile unsigned int*)0x06A0))
 
-// Configuracion.
-#define SD_DETECCION_HARDWARE 1      // 1 = usa el contacto del zocalo (RA4).
-#define FP 80000000
+// ------------------------------ CONFIGURACION --------------------------------
+#define ID_NODO            2        // Poner 2 en el segundo nodo
+#define SECTOR_INICIAL     2048UL   // OJO: sobrescribe datos de la tarjeta desde ese sector
+#define REINTENTOS_SD      3
 
-// Prueba unitaria.
-#define SECTOR_PRUEBA 2500UL
-#define INTENTOS_INIT 10
+// Ajuste fino del oscilador interno (FRC): -32 a +31, cada paso = 0.375 %.
+#define OSC_TUN            0
 
-// Codigos de error por parpadeos.
-#define ERR_INIT        1
-#define ERR_ESCRITURA   2
-#define ERR_LECTURA     3
-#define ERR_COMPARACION 4
-#define ERR_COPIA       5
+// Baud del bus RS485. Debe ser IGUAL en el Concentrador y en los nodos.
+#define BAUD_RS485         500000
 
-// Indices de trabajo.
-unsigned int i, j, x, y;
+// Prioridad de la interrupcion del UART1 RX (1 a 7).
+#define U1RX_PRIORIDAD     7
 
-// Pines y estado de la tarjeta.
-struct sdflags sdflags;
-sbit TEST at LATA2_bit;                    // LED de prueba.
+// Silencio (us) que separa una trama de la siguiente. Si pasa este tiempo entre dos bytes
+// se descarta la trama en curso. Timer2 con prescaler 1:8 (5 MHz): maximo ~13000 us.
+// Antes eran 400 us; 2000 us tolera pausas entre bytes del Concentrador y sigue siendo
+// mucho menor que el segundo entre tramas.
+#define SILENCIO_US        2000
+
+#define RS485_BYTE_INICIO  0x3A
+#define RS485_DIR_BCAST    0xFF
+#define RS485_FUNC_TIEMPO  0x54
+
+// Pulso pps fisico: RB14 / RP46 (salida RO del MAX485 U5, red INT_SINC) -> INT1
+#define PPS_PIN_RP         46
+
+// Flanco de INT1: 0 = automatico (segun el nivel de reposo), 1 = bajada, 2 = subida.
+#define PPS_FLANCO         0
+
+// Byte 3 de cada sector: 0x45 = version con INT1 y recepcion por urx_1
+#define FW_FLAGS           0x45
+// -----------------------------------------------------------------------------
+
+// Pines
+sbit TEST at LATA2_bit;                    // LED D1
 sbit TEST_Direction at TRISA2_bit;
-sbit CsADXL at LATA3_bit;                  // Chip select del acelerometro.
+sbit CsADXL at LATA3_bit;
 sbit CsADXL_Direction at TRISA3_bit;
-sbit sd_CS_lat at LATB0_bit;               // Chip select de la SD.
+sbit sd_CS_lat at LATB0_bit;
 sbit sd_CS_tris at TRISB0_bit;
-sbit sd_detect_port at PORTA.B4;           // Card-detect: se lee PORT, no LAT.
+sbit sd_detect_port at PORTA.B4;
 sbit sd_detect_tris at TRISA4_bit;
-sbit MSRS485 at LATB12_bit;                // Modo del transceptor RS485.
+sbit MSRS485 at LATB12_bit;                // Control MAX485 (DE/RE)
 sbit MSRS485_Direction at TRISB12_bit;
 
-// Estado general.
-unsigned short inicioSistema;
-unsigned long horaSistema, fechaSistema;
+// Requerido por sdcard.c (extern struct sdflags sdflags)
+struct sdflags sdflags;
 
-// Sectores de la SD.
-unsigned long PSF;
-unsigned long PSE;
-unsigned long USF;
-unsigned long PSEC;
-unsigned long sectorSD;
-unsigned long sectorLec;
-const unsigned int clusterSizeSD = 512;
-unsigned long infoPrimerSector;
-unsigned long infoUltimoSector;
-unsigned char cabeceraSD[6] = {255, 253, 251, 10, 0, 250};
-unsigned char bufferSD[clusterSizeSD];
-unsigned char checkEscSD;
-unsigned char checkLecSD;
-unsigned short banInsSec;
+// ------------------------------ VARIABLES ------------------------------------
+// Compartidas con las ISR (urx_1 e INT1)
+volatile unsigned long  timestamp_local;    // Contador local (trama y pulso pps)
+volatile unsigned int   pulsosPPS;          // Pulsos fisicos contados por INT1
 
-// Prototipos.
+// Recepcion de la trama (maquina de estados de urx_1)
+unsigned char rxBuf[8];
+unsigned char rxIdx;
+unsigned char rxChk;
+volatile unsigned short banTramaValida;     // 1 = hay una trama valida pendiente de guardar
+volatile unsigned long  tsRecibido;         // ultimo timestamp valido recibido
+
+// Diagnostico (los incrementa urx_1; main solo los lee)
+volatile unsigned long  tsAnterior;
+volatile unsigned short hayAnterior;
+volatile unsigned int   erroresChecksum;
+volatile unsigned int   saltosTiempo;
+volatile unsigned int   tramasPerdidas;
+volatile unsigned int   discrepanciasPPS;   // tramas cuyo timestamp no coincide con el contador de pulsos
+volatile unsigned int   cntFueraTrama;      // bytes descartados fuera de trama
+volatile unsigned int   cntSilencioMedio;   // tramas truncadas por silencio a mitad de trama
+volatile unsigned int   cntErrorUART;       // FERR / PERR
+
+// Registro SD (solo main)
+unsigned char bufferSector[512];
+unsigned long sector_actual;
+unsigned long contadorPaquetes;
+unsigned int  erroresSD;
+unsigned char sd_ultimo_wr;                 // ultimo codigo devuelto por SD_Write_Block
+unsigned char polaridadPPS = 0;             // 1 = reposo alto (flanco de bajada), 0 = reposo bajo
+volatile unsigned char rxDescarte;          // destino de bytes descartados (volatile: no se elimina la lectura)
+
+// Prototipos
 void ConfiguracionPrincipal();
 void ConfigurarPPS_SPI1();
-void EsperarTarjeta();
-void Ejemplo_uso_SD();
-void GuardarTramaSD();
-void GuardarBufferSD(unsigned char* bufferLleno, unsigned long sector);
-void GuardarInfoSector(unsigned long datoSector, unsigned long localizacionSector);
-void LED(int veces, unsigned char tiempo_seg);
-void LED_Error(unsigned char codigo, unsigned char detalle);
-unsigned char Detalle(unsigned char estado);
+void ConfigurarPPS_UART1();
+void ConfigurarPPS_INT1();
+void ConfigurarTimeoutRx();
+void ErrorFatal();
+void VaciarUART();
+void EscribirSector(unsigned long ts);
+unsigned char GuardarSector(unsigned long sector);
+void PonerU16(unsigned int pos, unsigned int v);
+void PonerU32(unsigned int pos, unsigned long v);
 
 // *****************************************************************************
 void main() {
+    unsigned long ts;
+    unsigned int  k;
+    unsigned char estadoSD;
+
+    // Marca de vida: LED encendido al arrancar, antes de configurar el reloj.
+    TRISAbits.TRISA2 = 0;
+    LATAbits.LATA2 = 1;
+
     ConfiguracionPrincipal();
 
-    // Indicador de arranque: 1 s encendido.
-    TEST = 1;
+    // Marca C: la configuracion termino. Tres parpadeos y 1 s apagado.
+    for (k = 0; k < 3; k++) {
+        TEST = 1;
+        Delay_ms(200);
+        TEST = 0;
+        Delay_ms(200);
+    }
     Delay_ms(1000);
-    TEST = 0;
 
-    // Inicializa variables.
-    i = 0; j = 0; x = 0; y = 0;
-    inicioSistema = 0;
-    horaSistema = 0;
-    fechaSistema = 0;
-    PSEC = 0;
-    sectorSD = 0;
-    sectorLec = 0;
-    checkEscSD = 0;
-    checkLecSD = 0;
-    banInsSec = 0;
-    MSRS485 = 0;                           // RS485 en modo lectura.
-
-    // Ultimo sector fisico segun capacidad.
-    PSF = 2048;
-    switch (SIZESD) {
-        case 2:  USF = 3911679;  break;
-        case 4:  USF = 7772160;  break;
-        case 8:  USF = 16779263; break;
-        case 16: USF = 31115263; break;
-        default: USF = 31115263; break;
-    }
-    infoPrimerSector = PSF + DELTASECTOR - 2;
-    infoUltimoSector = PSF + DELTASECTOR - 1;
-    PSE = PSF + DELTASECTOR;
-
-    horaSistema = 86100;                   // 23:55:00 (prueba).
-    fechaSistema = 200228;                 // 20/02/28 (prueba).
-
-    // 1. Espera la tarjeta (o la da por presente si no hay card-detect).
-    EsperarTarjeta();
-
-    // 2. Inicializa la SD (SLOW durante comandos, FAST al terminar).
-    if (sdflags.detected && !sdflags.init_ok) {
-        checkEscSD = SD_Init_Try(INTENTOS_INIT);
-        if (checkEscSD == SUCCESSFUL_INIT) {
-            sdflags.init_ok = true;
-            inicioSistema = 1;
-        } else {
-            sdflags.init_ok = false;
-            inicioSistema = 0;
-            LED_Error(ERR_INIT, Detalle(checkEscSD));   // No retorna.
-        }
+    // Inicializacion de la SD. Si falla: parpadeo rapido continuo.
+    estadoSD = SD_Init_Try(5);
+    if (estadoSD != SUCCESSFUL_INIT) {
+        ErrorFatal();
     }
 
-    // 3-6. Prueba unitaria de escritura / lectura / comparacion / copia.
-    Ejemplo_uso_SD();
+    for (k = 0; k < 512; k++) bufferSector[k] = 0x00;
+    sector_actual       = SECTOR_INICIAL;
+    contadorPaquetes    = 0;
+    erroresSD           = 0;
+    erroresChecksum     = 0;
+    saltosTiempo        = 0;
+    tramasPerdidas      = 0;
+    discrepanciasPPS    = 0;
+    cntFueraTrama       = 0;
+    cntSilencioMedio    = 0;
+    cntErrorUART        = 0;
+    hayAnterior         = 0;
+    tsAnterior          = 0;
+    pulsosPPS           = 0;
+    timestamp_local     = 0;
 
-    // Todo correcto: LED fijo.
-    TEST = 1;
+    // Durante el arranque de la SD llegaron bytes con la interrupcion apagada: se vacia el FIFO
+    // (con OERR = 1 el UART no recibe ni interrumpe hasta limpiarlo) y se reinicia la trama.
+    VaciarUART();
+    rxIdx = 0;
+    rxChk = 0;
+    banTramaValida = 0;
+    tsRecibido = 0;
+    T2IF_bit = 0;
+    TMR2 = 0;
+    U1RXIF_bit = 0;
+    INT1IF_bit = 0;
+
+    U1RXIE_bit = 1;                   // la trama entra por la interrupcion urx_1
+    INT1IE_bit = 1;                   // el pulso fisico cuenta los segundos
+
     while (1) {
         asm CLRWDT;
+
+        // Proteccion: con OERR = 1 el UART deja de recibir y no vuelve a interrumpir.
+        if (U1STAbits.OERR == 1) {
+            U1RXIE_bit = 0;
+            U1STAbits.OERR = 0;
+            rxIdx = 0;
+            erroresChecksum++;
+            U1RXIE_bit = 1;
+        }
+
+        if (banTramaValida && (T2IF_bit == 1)) {
+            // Trama valida y silencio posterior: se guarda. Copia atomica del timestamp.
+            U1RXIE_bit = 0;
+            ts = tsRecibido;
+            banTramaValida = 0;
+            U1RXIE_bit = 1;
+
+            EscribirSector(ts);
+        }
     }
 }
 
 // *****************************************************************************
-// Espera a que la tarjeta este insertada y estable.
+// Arma y escribe un sector con el timestamp recibido.
 // *****************************************************************************
-void EsperarTarjeta() {
-#if SD_DETECCION_HARDWARE
+void EscribirSector(unsigned long ts) {
+    unsigned long paquete;
+
+    paquete = contadorPaquetes + 1;
+
+    bufferSector[0] = 0xA5;
+    bufferSector[1] = 0x5A;
+    bufferSector[2] = ID_NODO;
+    bufferSector[3] = FW_FLAGS | (polaridadPPS << 1);
+    PonerU32(4,  ts);
+    PonerU32(8,  paquete);
+    PonerU32(12, sector_actual);
+    PonerU16(16, erroresChecksum);
+    PonerU16(18, saltosTiempo);
+    PonerU16(20, erroresSD);
+    PonerU16(22, tramasPerdidas);
+    PonerU16(24, pulsosPPS);
+    PonerU16(26, discrepanciasPPS);
+    PonerU16(28, cntFueraTrama);
+    PonerU16(30, cntSilencioMedio);
+    PonerU16(32, cntErrorUART);
+
+    if (GuardarSector(sector_actual)) {
+        contadorPaquetes = paquete;
+        sector_actual++;
+    } else {
+        erroresSD++;                    // el mismo sector se reintenta en la siguiente escritura
+    }
+}
+
+// *****************************************************************************
+// Escribe bufferSector en 'sector' con reintentos y reinicializacion de la SD.
+// Devuelve 1 si la escritura fue aceptada.
+// *****************************************************************************
+unsigned char GuardarSector(unsigned long sector) {
+    unsigned char n, r;
+    for (n = 0; n < REINTENTOS_SD; n++) {
+        r = SD_Write_Block(bufferSector, sector);
+        sd_ultimo_wr = r;
+        if (r == DATA_ACCEPTED) return 1;
+        if (n == 1) SD_Init_Try(3);      // Tras el segundo fallo, reinicia la tarjeta
+    }
+    return 0;
+}
+
+// Vacia el FIFO del UART1 (4 bytes) y limpia OERR.
+// El destino es una variable volatile y el bucle tiene tope: si solo se asignara a una local
+// sin uso, el optimizador de MikroC elimina la lectura de U1RXREG y el bucle se cuelga.
+void VaciarUART() {
+    unsigned char n;
+    for (n = 0; (n < 16) && (U1STAbits.URXDA == 1); n++) {
+        rxDescarte = U1RXREG;
+    }
+    U1STAbits.OERR = 0;
+}
+
+void PonerU16(unsigned int pos, unsigned int v) {
+    bufferSector[pos]     = (unsigned char)(v >> 8);
+    bufferSector[pos + 1] = (unsigned char)(v);
+}
+
+void PonerU32(unsigned int pos, unsigned long v) {
+    bufferSector[pos]     = (unsigned char)(v >> 24);
+    bufferSector[pos + 1] = (unsigned char)(v >> 16);
+    bufferSector[pos + 2] = (unsigned char)(v >> 8);
+    bufferSector[pos + 3] = (unsigned char)(v);
+}
+
+void ErrorFatal() {
     while (1) {
-        if (SD_Detect() == DETECTED) {
-            Delay_ms(100);                 // Antirrebote.
-            if (SD_Detect() == DETECTED) {
-                Delay_ms(200);             // Deja asentar la tarjeta.
-                sdflags.detected = true;
-                break;
-            }
-        } else {
-            sdflags.detected = false;
-            sdflags.init_ok = false;
-        }
+        asm CLRWDT;
+        TEST = ~TEST;
         Delay_ms(100);
     }
-#else
-    sdflags.detected = true;
-#endif
 }
 
 // *****************************************************************************
-// Prueba unitaria: escribe, lee, compara byte a byte y copia al sector +1.
+// Recepcion RS485 (UART1) por interrupcion - maquina de estados de la trama.
+// Timer2 sirve de deteccion de silencio: si pasan > SILENCIO_US sin bytes, T2IF queda en 1
+// y la trama siguiente empieza desde cero.
 // *****************************************************************************
-void Ejemplo_uso_SD() {
-    unsigned char data_to_write[512];
-    unsigned char buffer[512];
-    unsigned int k;
-    unsigned long sector;
+void urx_1() org IVT_ADDR_U1RXINTERRUPT {
+    unsigned char b;
+    unsigned long ts;
 
-    // Patron 00 01 02 ... FF repetido dos veces.
-    for (k = 0; k < 512; k++) {
-        data_to_write[k] = (unsigned char)(k & 0xFF);
-        buffer[k] = 0;
+    U1RXIF_bit = 0;                       // Limpiar al inicio, no al final
+
+    if (U1STAbits.OERR == 1) {            // Desbordamiento de FIFO
+        U1STAbits.OERR = 0;
+        rxIdx = 0;
+        erroresChecksum++;
     }
 
-    sector = SECTOR_PRUEBA;
+    while (U1STAbits.URXDA) {
+        // Los flags de error corresponden al byte que esta al frente del FIFO: se leen antes
+        if ((U1STAbits.FERR == 1) || (U1STAbits.PERR == 1)) cntErrorUART++;
+        b = U1RXREG;
 
-    // Escritura.
-    checkEscSD = SD_Write_Block(data_to_write, sector);
-    if (checkEscSD != DATA_ACCEPTED) {
-        LED_Error(ERR_ESCRITURA, Detalle(checkEscSD));
-    }
-    LED(1, 1);
+        if (T2IF_bit) {                   // Hubo silencio: nueva trama
+            if (rxIdx != 0) cntSilencioMedio++;   // ...pero la anterior no estaba completa
+            rxIdx = 0;
+        }
+        T2IF_bit = 0;
+        TMR2 = 0;
 
-    // Lectura a RAM.
-    checkLecSD = SD_Read_Block(buffer, sector);
-    if (checkLecSD != 0) {
-        LED_Error(ERR_LECTURA, Detalle(checkLecSD));
-    }
-    LED(1, 1);
+        if (rxIdx == 0) {
+            if (b == RS485_BYTE_INICIO) {
+                rxBuf[0] = b;
+                rxChk = b;
+                rxIdx = 1;
+            } else {
+                cntFueraTrama++;
+            }
+        }
+        else if (rxIdx < 7) {
+            rxBuf[rxIdx] = b;
+            rxChk = rxChk + b;
+            rxIdx++;
+        }
+        else {                            // rxIdx == 7: byte de checksum
+            rxIdx = 0;
+            if ((b == rxChk) &&
+                (rxBuf[2] == RS485_FUNC_TIEMPO) &&
+                ((rxBuf[1] == RS485_DIR_BCAST) || (rxBuf[1] == ID_NODO))) {
 
-    // Comparacion byte a byte.
-    for (k = 0; k < 512; k++) {
-        if (buffer[k] != data_to_write[k]) {
-            LED_Error(ERR_COMPARACION, 0);
+                ts = ((unsigned long)rxBuf[3] << 24) | ((unsigned long)rxBuf[4] << 16) |
+                     ((unsigned long)rxBuf[5] << 8)  |  (unsigned long)rxBuf[6];
+
+                if (hayAnterior && (ts != (tsAnterior + 1))) saltosTiempo++;
+                // El pulso llega antes que la trama: el contador de pulsos ya debe valer ts.
+                // INT1 (prioridad 5) no puede interrumpir esta ISR (prioridad 7): lectura atomica.
+                if (hayAnterior && (timestamp_local != ts)) discrepanciasPPS++;
+                tsAnterior = ts;
+                hayAnterior = 1;
+
+                if (banTramaValida) tramasPerdidas++;   // main no alcanzo a guardar la anterior
+
+                tsRecibido = ts;
+                timestamp_local = ts;                   // Resincroniza el contador local
+                banTramaValida = 1;
+
+                // CP 3.1: LED segun la paridad del timestamp (encendido con ts par)
+                if ((ts & 1) == 0) TEST = 1; else TEST = 0;
+            } else {
+                erroresChecksum++;
+            }
         }
     }
-    LED(1, 1);
-
-    // Copia lo leido al sector siguiente.
-    checkEscSD = SD_Write_Block(buffer, sector + 1);
-    if (checkEscSD != DATA_ACCEPTED) {
-        LED_Error(ERR_COPIA, Detalle(checkEscSD));
-    }
-    LED(1, 1);
 }
 
 // *****************************************************************************
-// Parpadeos de 1 o 2 segundos (tiempo_seg = 1 o 2).
+// Pulso fisico de sincronismo (INT1): avanza el contador local
 // *****************************************************************************
-void LED(int veces, unsigned char tiempo_seg) {
-    unsigned int n;
-    TEST_Direction = 0;
-    if (tiempo_seg == 1) {
-        for (n = 0; n < veces; n++) {
-            TEST = 1; Delay_ms(1000);
-            TEST = 0; Delay_ms(1000);
-        }
-    } else if (tiempo_seg == 2) {
-        for (n = 0; n < veces; n++) {
-            TEST = 1; Delay_ms(2000);
-            TEST = 0; Delay_ms(2000);
-        }
-    }
-}
-
-// *****************************************************************************
-// Error en dos grupos de parpadeos (ver cabecera). No retorna.
-// *****************************************************************************
-void LED_Error(unsigned char codigo, unsigned char detalle) {
-    unsigned char n;
-    while (1) {
-        for (n = 0; n < codigo; n++) {
-            TEST = 1; Delay_ms(300);
-            TEST = 0; Delay_ms(300);
-        }
-        Delay_ms(1500);
-        for (n = 0; n < detalle; n++) {
-            TEST = 1; Delay_ms(100);
-            TEST = 0; Delay_ms(200);
-        }
-        Delay_ms(4000);
-    }
-}
-
-// Convierte el estado de la libreria SD en un numero pequeno de parpadeos.
-unsigned char Detalle(unsigned char estado) {
-    switch (estado) {
-        case SD_NOT_READY:            return 1;
-        case TOKEN_NOT_RECEIVED:      return 2;
-        case 0xFF:                    return 3;
-        case DATA_REJECTED_CRC_ERROR: return 4;
-        case DATA_REJECTED_WR_ERROR:  return 5;
-        case ERROR:                   return 6;
-        default:                      return 7;
-    }
+void int_1() org IVT_ADDR_INT1INTERRUPT {
+    INT1IF_bit = 0;
+    timestamp_local++;
+    pulsosPPS++;
 }
 
 // *****************************************************************************
 void ConfiguracionPrincipal() {
+    unsigned long guardiaPLL;
 
-    // Configuración para Fosc ~= 80 MHz usando FRC interno (7.37 MHz)
-    // Fosc = Fin * (M / (N1 * N2)) = 7.37 MHz * (43 / (2 * 2)) = 79.22 MHz
-    PLLFBD = 41;             // M = 43 (El registro requiere el valor M - 2)
-    CLKDIVbits.PLLPOST = 0;  // N2 = 2 (El valor 0 significa divisor de 2)
-    CLKDIVbits.PLLPRE = 0;   // N1 = 2 (El valor 0 significa divisor de 2)
-
-    // Espera obligatoria hasta que el PLL se estabilice
-    while (OSCCONbits.LOCK != 1) {};
-
-    Delay_ms(4000);                        // Estabilizacion inicial.
+    // Mismo reloj que el Concentrador: FRC/7 * 152 / 2 = ~80 MHz
+    CLKDIVbits.FRCDIV = 0;
+    CLKDIVbits.PLLPOST = 0;
+    CLKDIVbits.PLLPRE = 5;
+    PLLFBDbits.PLLDIV = 150;
+    OSCTUN = (OSC_TUN & 0x3F);            // Ajuste fino del FRC
+    guardiaPLL = 400000;
+    while ((OSCCONbits.LOCK != 1) && (guardiaPLL > 0)) guardiaPLL--;
+    if (OSCCONbits.LOCK != 1) {
+        // El PLL no engancha: casi siempre es Oscillator Source distinto de FRCPLL en Edit Project.
+        TRISAbits.TRISA2 = 0;
+        while (1) { LATAbits.LATA2 = ~LATAbits.LATA2; Delay_ms(50); }
+    }
+    Delay_ms(100);                        // Estabilizacion antes de configurar el UART
+    LATAbits.LATA2 = 0;                   // Marca B: el PLL engancho, LED apagado
 
     ANSELA = 0;
     ANSELB = 0;
+
     ConfigurarPPS_SPI1();
+    ConfigurarPPS_UART1();
+    ConfigurarPPS_INT1();                 // INT1 <- RB14, en la misma ventana de PPS que SPI1 y UART1
 
     TEST_Direction = 0;
     TEST = 0;
 
-    // CS del acelerometro inactivo para que no use el bus SPI.
     CsADXL_Direction = 0;
     CsADXL = 1;
-
-    // CS de la SD inactivo.
     sd_CS_tris = 0;
     sd_CS_lat = 1;
-
-    // Card-detect: entrada con pull-up interno (contacto a GND con tarjeta).
     sd_detect_tris = 1;
     CNPUAbits.CNPUA4 = 1;
 
+    // MAX485 siempre en recepcion
     MSRS485_Direction = 0;
+    MSRS485 = 0;
 
-    sdflags.detected = false;
-    sdflags.init_ok = false;
-    sdflags.saving = false;
+    // UART1: la interrupcion se habilita en main() despues de iniciar la SD
+    UART1_Init_Advanced(BAUD_RS485, _UART_8BIT_NOPARITY, _UART_ONE_STOPBIT, _UART_HI_SPEED);
+    U1STAbits.URXISEL = 0x00;             // interrupcion con cada byte recibido
+    IPC2 = (IPC2 & 0x8FFF) | ((unsigned int)U1RX_PRIORIDAD << 12);   // U1RXIP<2:0> = bits 14:12
+    U1RXIF_bit = 0;
+    U1RXIE_bit = 0;
 
-    Delay_ms(200);
+    ConfigurarTimeoutRx();
+
+    TRISBbits.TRISB14 = 1;                // RB14 (RP46) entrada: pulso de sincronismo
+    // Polaridad automatica: se lee el nivel de reposo de RB14 y se dispara en el flanco que SALE
+    // del reposo (inicio del pulso). Reposo alto -> flanco de bajada; reposo bajo -> flanco de subida.
+    Delay_ms(5);
+#if PPS_FLANCO == 1
+    INTCON2.INT1EP = 1; polaridadPPS = 1;                                // forzado: flanco de bajada
+#elif PPS_FLANCO == 2
+    INTCON2.INT1EP = 0; polaridadPPS = 0;                                // forzado: flanco de subida
+#else
+    if (PORTBbits.RB14 == 1) { INTCON2.INT1EP = 1; polaridadPPS = 1; }   // flanco de bajada
+    else                     { INTCON2.INT1EP = 0; polaridadPPS = 0; }   // flanco de subida
+#endif
+    IPC5bits.INT1IP = 0x05;
+    INT1IF_bit = 0;
+    INT1IE_bit = 0;                       // se habilita en main() tras iniciar la SD
+
+    INTCON2.GIE = 1;
 }
 
-// SCK1OUT en RB7, SDO1 en RB8 y SDI1 en RB9.
+// Timer2 libre (sin interrupcion): periodo SILENCIO_US (Fcy = 40 MHz, prescaler 1:8 -> 5 MHz)
+void ConfigurarTimeoutRx() {
+    T2CON = 0x0010;                       // TCKPS<1:0> = 01 (1:8), apagado
+    TMR2 = 0;
+    PR2 = (unsigned int)(SILENCIO_US * 5UL);
+    T2IF_bit = 0;
+    T2IE_bit = 0;
+    T2CON.TON = 1;
+}
+
 void ConfigurarPPS_SPI1() {
     asm {
         MOV #0x46, W0
@@ -339,78 +477,39 @@ void ConfigurarPPS_SPI1() {
         MOV.b W1, [W2]
         BCLR OSCCON, #6
     }
-
-    RPOR2 = (RPOR2 & 0x00FF) | 0x0600;
-    RPOR3 = (RPOR3 & 0xFF00) | 0x0005;
-    RPINR20 = (RPINR20 & 0xFF00) | 41;
-
+    RPOR2 = (RPOR2 & 0x00FF) | 0x0600;    // RP39 (RB7)  -> SCK1
+    RPOR3 = (RPOR3 & 0xFF00) | 0x0005;    // RP40 (RB8)  -> SDO1
+    RPINR20 = (RPINR20 & 0xFF00) | 41;    // RP41 (RB9)  <- SDI1
     TRISBbits.TRISB7 = 0;
     TRISBbits.TRISB8 = 0;
     TRISBbits.TRISB9 = 1;
 }
 
-// *****************************************************************************
-// Rutinas para fases posteriores (no se llaman en esta prueba).
-// *****************************************************************************
-
-// Escribe un buffer de 512 bytes con hasta cinco intentos.
-void GuardarBufferSD(unsigned char* bufferLleno, unsigned long sector) {
-    for (x = 0; x < 5; x++) {
-        checkEscSD = SD_Write_Block(bufferLleno, sector);
-        if (checkEscSD == DATA_ACCEPTED) {
-            break;
-        }
-        Delay_us(10);
+void ConfigurarPPS_UART1() {
+    asm {
+        MOV #0x46, W0
+        MOV #0x57, W1
+        MOV #0x0742, W2
+        MOV.b W0, [W2]
+        MOV.b W1, [W2]
+        BCLR OSCCON, #6
     }
+    RPINR18bits.U1RXR = 47;  // RX en RB15
+    RPOR1bits.RP36R = 1;     // TX en RB4
+    TRISBbits.TRISB15 = 1;
+    TRISBbits.TRISB4 = 0;
 }
 
-// Guarda una trama de prueba en sectores consecutivos.
-void GuardarTramaSD() {
-    unsigned char buf[512];
-
-    for (sectorSD = 40000; sectorSD < 40020; sectorSD++) {
-        for (x = 0; x < 6; x++)   buf[x] = 1;
-        for (x = 0; x < 6; x++)   buf[6 + x] = 2;
-        for (x = 0; x < 500; x++) buf[12 + x] = 3;
-        GuardarBufferSD(buf, sectorSD);
-        sectorSD++;
-
-        for (x = 0; x < 512; x++) buf[x] = 4;
-        GuardarBufferSD(buf, sectorSD);
-        sectorSD++;
-
-        for (x = 0; x < 512; x++) buf[x] = 5;
-        GuardarBufferSD(buf, sectorSD);
-        sectorSD++;
-
-        for (x = 0; x < 512; x++) buf[x] = 6;
-        GuardarBufferSD(buf, sectorSD);
-        sectorSD++;
-
-        for (x = 0; x < 512; x++) buf[x] = (x < 464) ? 7 : 0;
-        // Escritura del quinto sector deshabilitada durante la prueba.
-
-        LED(3, 1);
+// Mapea INT1 al pin RB14 (RP46): salida RO del MAX485 U5 (red INT_SINC).
+void ConfigurarPPS_INT1() {
+    asm {
+        MOV #0x46, W0
+        MOV #0x57, W1
+        MOV #0x0742, W2
+        MOV.b W0, [W2]
+        MOV.b W1, [W2]
+        BCLR OSCCON, #6
     }
-}
-
-// Guarda un numero de sector (big-endian) dentro de un sector.
-void GuardarInfoSector(unsigned long datoSector, unsigned long localizacionSector) {
-    unsigned char bufferSectores[512];
-
-    bufferSectores[0] = (datoSector >> 24) & 0xFF;
-    bufferSectores[1] = (datoSector >> 16) & 0xFF;
-    bufferSectores[2] = (datoSector >> 8) & 0xFF;
-    bufferSectores[3] = (datoSector) & 0xFF;
-    for (x = 4; x < 512; x++) {
-        bufferSectores[x] = 0;
-    }
-
-    for (x = 0; x < 5; x++) {
-        checkEscSD = SD_Write_Block(bufferSectores, localizacionSector);
-        if (checkEscSD == DATA_ACCEPTED) {
-            break;
-        }
-        Delay_us(10);
-    }
+    TRISBbits.TRISB14 = 1;
+    RPINR0 = (RPINR0 & 0x80FF) | ((unsigned int)PPS_PIN_RP << 8);   // INT1 <- RP46 (por direccion)
 }
