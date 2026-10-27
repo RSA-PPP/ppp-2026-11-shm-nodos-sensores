@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------------------------------------------------------
-Nodo Concentrador - Sistema de Monitorizacion de Salud Estructural V1.7
+Nodo Concentrador - Sistema de Monitorizacion de Salud Estructural V1.8 (Fase 4)
 Autor original: Geovanny Cullquicondo
 
 Descripcion (Fase 3):
-  - Timer3 genera una base de 1 s (10 interrupciones de 100 ms).
+  - Timer3 genera una base de 1 ms; cada PERIODO_SYNC_MS ms emite un pulso (PULSOS_POR_SEG).
   - En cada segundo, la ISR SOLO: incrementa el timestamp, sube el pulso INT_SINC_1
     y levanta una bandera. No transmite ni usa delays dentro de la ISR.
   - El bucle principal envia la trama de tiempo por RS485 (UART2 + MAX485) y baja el pulso.
@@ -57,14 +57,30 @@ sbit INT_SINC_2_Direction at TRISA3_bit;
 
 //////////////////////////////////////////////  Constantes  /////////////////////////////////////////////////////////////////
 
-#define PERIODO_SYNC_MS       1000
+// Fase 4: tasa de pulsos y tren finito para las pruebas de estres.
+// PULSOS_POR_SEG debe dividir 1000 (1, 2, 4, 5, 8, 10, 20, 25, 40, 50, 100, 125, 200, 250, 500).
+// Recomendado <= 200: el nodo usa un silencio de 2 ms para separar tramas.
+#define PULSOS_POR_SEG        1
+// 0 = pulsos continuos. N > 0 = emite exactamente N pulsos y se detiene.
+// Cada nodo graba N-1 sectores (el primer pulso llega antes de la primera trama de tiempo),
+// por eso para 500 sectores por tarjeta se usa N = 501.
+#define NUM_PULSOS_TREN       0
+// Espera antes de iniciar un tren finito, para que los nodos terminen SD_Init y queden listos.
+#define RETARDO_INICIO_S      10
+
+#define PERIODO_SYNC_MS       (1000 / PULSOS_POR_SEG)
+#define TICK_TIMER3_MS        1        // Timer3 interrumpe cada 1 ms (exacto: ver ConfiguracionPrincipal)
+#if PULSOS_POR_SEG <= 100
 #define ANCHO_PULSO_SYNC_US   1000     // Tiempo en alto del pulso, contado despues de enviar la trama
-#define TICK_TIMER3_MS        100
+#else
+#define ANCHO_PULSO_SYNC_US   100
+#endif
 
 //////////////////////////////////////////////  Variables globales  /////////////////////////////////////////////////////////
 
 // Reloj maestro de la red (segundos desde el arranque). Se modifica en ISR.
 volatile unsigned long timestamp_global;
+volatile unsigned long pulsosEmitidos;     // pulsos emitidos en el tren actual
 volatile unsigned short banSyncPendiente;
 
 // SPI / RPi (logica original, sin cambios)
@@ -105,10 +121,12 @@ extern void EnviarTramaTiempoRS485(unsigned short puerto, unsigned long timestam
 
 void main() {
      unsigned long tsEnvio;
+     unsigned short kInicio;
 
      ConfiguracionPrincipal();
 
      timestamp_global = 0;
+     pulsosEmitidos = 0;
      banSyncPendiente = 0;
 
      banSPI0 = 0; banSPI1 = 0; banSPI2 = 0; banSPI7 = 0; banSPI8 = 0; banSPIA = 0;
@@ -165,6 +183,14 @@ void main() {
           Delay_ms(1);
      }
 #else
+#if NUM_PULSOS_TREN > 0
+     // Tren finito: espera para que los nodos queden listos (D5 parpadea rapido durante la espera)
+     for (kInicio = 0; kInicio < (RETARDO_INICIO_S * 4); kInicio++){
+          asm CLRWDT;
+          INT_SINC = ~INT_SINC;
+          Delay_ms(250);
+     }
+#endif
      T3CON.TON = 1;     // Inicia temporizador de sincronismo
 
      while(1){
@@ -236,12 +262,12 @@ void ConfiguracionPrincipal(){
      PR2 = 46875;
      IPC1bits.T2IP = 0x02;
 
-     // Timer3: base de tiempo. Fcy/256 = 156250 Hz; PR3 = 15625 -> 100 ms por interrupcion
-     T3CON = 0x30;
+     // Timer3: base de 1 ms. Fcy/64 = 625000 Hz; PR3 = 624 -> (624+1)/625000 = 1.000 ms exactos
+     T3CON = 0x20;
      T3CON.TON = 0;
      TMR3 = 0;
      T3IF_bit = 0;
-     PR3 = 15625;
+     PR3 = 624;
      IPC2bits.T3IP = 0x02;
      T3IE_bit = 1;
 
@@ -299,8 +325,15 @@ void Timer3Int() org IVT_ADDR_T3INTERRUPT{
      if (contadorSync >= (PERIODO_SYNC_MS / TICK_TIMER3_MS)){
         contadorSync = 0;
 
-        timestamp_global++;           // Tiempo absoluto de la red
-        INT_SINC = ~INT_SINC;         // D5: heartbeat
+#if NUM_PULSOS_TREN > 0
+        if (pulsosEmitidos >= NUM_PULSOS_TREN){
+           T3CON.TON = 0;             // Tren completo: se detiene la emision
+           return;
+        }
+        pulsosEmitidos++;
+#endif
+        timestamp_global++;           // Contador de sincronismo (+1 por pulso)
+        INT_SINC = ~INT_SINC;         // D5: cambia en cada pulso
         INT_SINC_1 = 1;               // Flanco de subida del pulso de sincronismo (instante exacto)
         banSyncPendiente = 1;         // El main envia la trama y baja el pulso
      }
